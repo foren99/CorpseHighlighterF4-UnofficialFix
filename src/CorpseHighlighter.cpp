@@ -174,10 +174,11 @@ namespace
 		return player ? player->formID : 0;
 	}
 
-	void Highlight(const RE::NiPointer<RE::TESObjectREFR>& a_corpse)
+	// Retry if 3D is not ready yet to handle rapid deaths
+	void Highlight(const RE::NiPointer<RE::TESObjectREFR>& a_corpse, int a_attempts = 15)
 	{
 		const auto epoch = g_gameEpoch.load(std::memory_order_acquire);
-		F4SE::GetTaskInterface()->AddTask([a_corpse, epoch]() {
+		F4SE::GetTaskInterface()->AddTask([a_corpse, epoch, a_attempts]() {
 			if (!g_gameActive.load(std::memory_order_acquire) ||
 				g_gameEpoch.load(std::memory_order_acquire) != epoch) {
 				return;
@@ -199,16 +200,32 @@ namespace
 				}
 			}
 
+			// Skip highlighting completely empty corpses
+			if (a_corpse->GetInventory().empty()) {
+				REX::INFO("corpse {:08X} is empty, skipped highlight", a_corpse->formID);
+				const std::lock_guard lock(g_lock);
+				g_seen.erase(a_corpse->formID);
+				return;
+			}
+
+			if (!a_corpse->Get3D()) {
+				if (a_attempts > 0) {
+					Highlight(a_corpse, a_attempts - 1);
+				} else {
+					REX::INFO("no 3D for {:08X}, gave up after retries", a_corpse->formID);
+					const std::lock_guard lock(g_lock);
+					g_seen.erase(a_corpse->formID);
+				}
+				return;
+			}
+
 			const auto choice = corpse_highlighter::ResolveShader(settings);
 			auto*      shader = LookupEffectShader(choice.formID, choice.plugin);
 			if (!shader) {
 				REX::WARN("effect shader {:08X} from '{}' not found, skipped", choice.formID, choice.plugin);
 				return;
 			}
-			if (!a_corpse->Get3D()) {
-				REX::INFO("no 3D for {:08X}, skipped", a_corpse->formID);
-				return;
-			}
+			
 			ApplyEffectShader(a_corpse.get(), shader, -1.0f);
 			{
 				const std::lock_guard lock(g_lock);
@@ -227,27 +244,40 @@ namespace
 				g_gameEpoch.load(std::memory_order_acquire) != epoch) {
 				return;
 			}
-			if (!corpse_highlighter::LoadLayeredSettings().stopWhenLooted) {
+			const auto settings = corpse_highlighter::LoadLayeredSettings();
+			if (!settings.stopWhenLooted) {
 				return;
 			}
+			
+			auto* const corpse = RE::TESForm::GetFormByID(a_corpseID);
+			auto* const reference = corpse ? corpse->As<RE::TESObjectREFR>() : nullptr;
+			if (!reference) {
+				return;
+			}
+
 			std::optional<std::uint32_t> shaderID;
 			{
 				const std::lock_guard lock(g_lock);
 				shaderID = g_lit.Take(a_corpseID);
 			}
+
+			// Fallback mechanism: Forcefully remove the shader if the in-memory map was cleared
+			// This handles cases where the game is saved and reloaded, causing the plugin to forget the corpse
 			if (!shaderID) {
-				return;
+				const auto choice = corpse_highlighter::ResolveShader(settings);
+				auto* effectShader = LookupEffectShader(choice.formID, choice.plugin);
+				if (effectShader) {
+					FinishShaderEffect(reference, effectShader);
+					REX::INFO("unlit {:08X} via fallback ({})", a_corpseID, a_reason);
+				}
+			} else {
+				auto* const shader = RE::TESForm::GetFormByID(*shaderID);
+				auto* const effectShader = shader ? shader->As<RE::TESEffectShader>() : nullptr;
+				if (effectShader) {
+					FinishShaderEffect(reference, effectShader);
+					REX::INFO("unlit {:08X} after {}", a_corpseID, a_reason);
+				}
 			}
-			auto* const corpse = RE::TESForm::GetFormByID(a_corpseID);
-			auto* const shader = RE::TESForm::GetFormByID(*shaderID);
-			auto* const reference = corpse ? corpse->As<RE::TESObjectREFR>() : nullptr;
-			auto* const effectShader = shader ? shader->As<RE::TESEffectShader>() : nullptr;
-			if (!reference || !effectShader) {
-				REX::WARN("unlight {:08X} after {}: ref or shader {:08X} gone", a_corpseID, a_reason, *shaderID);
-				return;
-			}
-			FinishShaderEffect(reference, effectShader);
-			REX::INFO("unlit {:08X} after {}", a_corpseID, a_reason);
 		});
 	}
 
@@ -281,16 +311,9 @@ namespace
 			if (!g_gameActive.load(std::memory_order_acquire) || !a_event.objectActivated || !a_event.actionRef) {
 				return RE::BSEventNotifyControl::kContinue;
 			}
-			const auto activated = a_event.objectActivated->formID;
-			const auto actor = a_event.actionRef->formID;
-			const auto player = PlayerFormID();
-			bool       looted = false;
-			{
-				const std::lock_guard lock(g_lock);
-				looted = corpse_highlighter::LootedByActivate(activated, actor, player, g_lit);
-			}
-			if (looted) {
-				Unlight(activated, "activate");
+			// Unlight when the player activates the corpse
+			if (a_event.actionRef->formID == PlayerFormID()) {
+				Unlight(a_event.objectActivated->formID, "activate");
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -305,14 +328,8 @@ namespace
 			if (!g_gameActive.load(std::memory_order_acquire)) {
 				return RE::BSEventNotifyControl::kContinue;
 			}
-			const auto player = PlayerFormID();
-			bool       looted = false;
-			{
-				const std::lock_guard lock(g_lock);
-				looted = corpse_highlighter::LootedByTransfer(
-					a_event.oldContainerFormID, a_event.newContainerFormID, player, g_lit);
-			}
-			if (looted) {
+			// Unlight when items are transferred from the corpse to the player
+			if (a_event.newContainerFormID == PlayerFormID()) {
 				Unlight(a_event.oldContainerFormID, "transfer");
 			}
 			return RE::BSEventNotifyControl::kContinue;
