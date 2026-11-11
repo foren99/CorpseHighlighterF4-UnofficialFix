@@ -201,7 +201,8 @@ namespace
 			}
 
 			// Skip highlighting completely empty corpses
-			if (a_corpse->GetInventory().empty()) {
+			auto* changes = a_corpse->GetInventoryChanges();
+			if (!changes || !changes->entryList || changes->entryList->empty()) {
 				REX::INFO("corpse {:08X} is empty, skipped highlight", a_corpse->formID);
 				const std::lock_guard lock(g_lock);
 				g_seen.erase(a_corpse->formID);
