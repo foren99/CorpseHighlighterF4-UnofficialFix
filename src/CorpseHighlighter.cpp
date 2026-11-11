@@ -201,12 +201,20 @@ namespace
 			}
 
 			// Skip highlighting completely empty corpses
-			auto* changes = a_corpse->GetInventoryChanges();
-			if (!changes || !changes->entryList || changes->entryList->empty()) {
-				REX::INFO("corpse {:08X} is empty, skipped highlight", a_corpse->formID);
-				const std::lock_guard lock(g_lock);
-				g_seen.erase(a_corpse->formID);
-				return;
+			auto* extraChanges = a_corpse->extraList.GetByType<RE::ExtraContainerChanges>();
+			bool hasItems = false;
+			if (extraChanges && extraChanges->changes) {
+   				auto* entryList = extraChanges->changes->entryList;
+   			 	if (entryList && !entryList->empty()) {
+       				hasItems = true;
+    			}
+			}
+
+			if (!hasItems) {
+    			REX::INFO("corpse {:08X} is empty, skipped highlight", a_corpse->formID);
+    			const std::lock_guard lock(g_lock);
+    			g_seen.erase(a_corpse->formID);
+	    		return;
 			}
 
 			if (!a_corpse->Get3D()) {
